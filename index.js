@@ -3,7 +3,6 @@ const app = express();
 const pgp = require('pg-promise')();
 const bodyParser = require('body-parser');
 const session = require('express-session');
-const url = require('url');
 
 // db config
 const dbConfig = {
@@ -46,6 +45,50 @@ app.use(
   })
 );
 
+const user = {
+  student_id: undefined,
+  username: undefined,
+  first_name: undefined,
+  last_name: undefined,
+  email: undefined,
+  year: undefined,
+  major: undefined,
+  degree: undefined,
+};
+
+const student_courses = `
+  SELECT DISTINCT
+    courses.course_id,
+    courses.course_name,
+    courses.credit_hours,
+    students.student_id = $1 AS "taken"
+  FROM
+    courses
+    JOIN student_courses ON courses.course_id = student_courses.course_id
+    JOIN students ON student_courses.student_id = students.student_id
+  WHERE students.student_id = $1
+  ORDER BY courses.course_id ASC;`;
+
+const all_courses = `
+  SELECT
+    courses.course_id,
+    courses.course_name,
+    courses.credit_hours,
+    CASE
+    WHEN
+    courses.course_id IN (
+      SELECT student_courses.course_id
+      FROM student_courses
+      WHERE student_courses.student_id = $1
+    ) THEN TRUE
+    ELSE FALSE
+    END
+    AS "taken"
+  FROM
+    courses
+  ORDER BY courses.course_id ASC;
+  `;
+
 app.get('/login', (req, res) => {
   res.render('pages/login');
 });
@@ -60,22 +103,19 @@ app.post('/login', (req, res) => {
   // get the student_id based on the emailid
   db.one(query, values)
     .then(data => {
-      req.session.student_id = data.student_id;
+      user.student_id = data.student_id;
+      user.username = username;
+      user.first_name = data.first_name;
+      user.last_name = data.last_name;
+      user.email = data.email;
+      user.year = data.year;
+      user.major = data.major;
+      user.degree = data.degree;
+
+      req.session.user = user;
       req.session.save();
-      res.redirect(
-        url.format({
-          pathname: '/',
-          query: {
-            username: username,
-            first_name: data.first_name,
-            last_name: data.last_name,
-            email: data.email,
-            year: data.year,
-            major: data.major,
-            degree: data.degree,
-          },
-        })
-      );
+
+      res.redirect('/');
     })
     .catch(err => {
       console.log(err);
@@ -85,7 +125,7 @@ app.post('/login', (req, res) => {
 
 // Authentication middleware.
 const auth = (req, res, next) => {
-  if (!req.session.student_id) {
+  if (!req.session.user) {
     return res.redirect('/login');
   }
   next();
@@ -95,54 +135,21 @@ app.use(auth);
 
 app.get('/', (req, res) => {
   res.render('pages/home', {
-    username: req.query.username,
-    first_name: req.query.first_name,
-    last_name: req.query.last_name,
-    email: req.query.email,
-    year: req.query.year,
-    major: req.query.major,
-    degree: req.query.degree,
+    username: req.session.user.username,
+    first_name: req.session.user.first_name,
+    last_name: req.session.user.last_name,
+    email: req.session.user.email,
+    year: req.session.user.year,
+    major: req.session.user.major,
+    degree: req.session.user.degree,
   });
 });
 
 app.get('/courses', (req, res) => {
-  const taken = req.query.taken
+  const taken = req.query.taken;
   // Query to list all the courses taken by a student
-  const student_courses = `
-    SELECT DISTINCT
-      courses.course_id,
-      courses.course_name,
-      courses.credit_hours,
-      students.student_id = $1 AS "taken"
-    FROM
-      courses
-      JOIN student_courses ON courses.course_id = student_courses.course_id
-      JOIN students ON student_courses.student_id = students.student_id
-    WHERE students.student_id = $1
-    ORDER BY courses.course_id ASC;`;
-  
-    // Query to list all the available courses 
-    const all_courses = `
-    SELECT 
-      courses.course_id,
-      courses.course_name,
-      courses.credit_hours,
-      CASE 
-      WHEN
-      courses.course_id IN (
-        SELECT student_courses.course_id
-        FROM student_courses
-        WHERE student_courses.student_id = $1
-      ) THEN TRUE
-      ELSE FALSE
-      END
-      AS "taken"
-    FROM 
-      courses
-    ORDER BY courses.course_id ASC;
-    `;
-  
-  db.any(taken ? student_courses : all_courses, [req.session.student_id])
+
+  db.any(taken ? student_courses : all_courses, [req.session.user.student_id])
     .then(courses => {
       res.render('pages/courses', {
         courses,
@@ -184,7 +191,7 @@ app.post('/courses/add', (req, res) => {
             WHERE
               course_id = $1
               AND student_id = $2`,
-        [course_id, req.session.student_id]
+        [course_id, req.session.user.student_id]
       );
 
       if (!row || row.num_prerequisites_satisfied < num_prerequisites) {
@@ -195,13 +202,13 @@ app.post('/courses/add', (req, res) => {
     // There are either no prerequisites, or all have been taken.
     await t.none(
       'INSERT INTO student_courses(course_id, student_id) VALUES ($1, $2);',
-      [course_id, req.session.student_id]
+      [course_id, req.session.user.student_id]
     );
     // TODO(corypaik): Update with query from /courses.
-    return t.any('SELECT * FROM courses;');
+    return t.any(all_courses, [req.session.user.student_id]);
   })
     .then(courses => {
-      console.info(courses);
+      //console.info(courses);
       res.render('pages/courses', {
         courses,
         message: `Successfully added course ${req.body.course_id}`,
@@ -225,10 +232,10 @@ app.post('/courses/delete', (req, res) => {
           WHERE
             student_id = $1
             AND course_id = '$2';`,
-        [req.session.student_id, parseInt(req.body.course_id)]
+        [req.session.user.student_id, parseInt(req.body.course_id)]
       ),
       // TODO(corypaik): Update with query from /courses.
-      task.any('SELECT * FROM courses;'),
+      task.any(student_courses, [req.session.user.student_id]),
     ]);
   })
     .then(([, courses]) => {
@@ -236,6 +243,7 @@ app.post('/courses/delete', (req, res) => {
       res.render('pages/courses', {
         courses,
         message: `Successfully removed course ${req.body.course_id}`,
+        action: 'delete',
       });
     })
     .catch(err => {
@@ -245,6 +253,11 @@ app.post('/courses/delete', (req, res) => {
         message: err.message,
       });
     });
+});
+
+app.get('/logout', (req, res) => {
+  req.session.destroy();
+  res.render('pages/logout');
 });
 
 app.listen(3000);
